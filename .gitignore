@@ -1,0 +1,11 @@
+build/
+build-*/
+*.o
+*.so
+*.raw
+*.pgm
+*.png
+*.pcap
+*.pcapng
+*.log
+compile_commands.json

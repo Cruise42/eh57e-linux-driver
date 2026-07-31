@@ -1,0 +1,177 @@
+diff --git a/libfprint/fp-image-device.c b/libfprint/fp-image-device.c
+index 519ad75..83e59c6 100644
+--- a/libfprint/fp-image-device.c
++++ b/libfprint/fp-image-device.c
+@@ -123,11 +123,13 @@ fp_image_device_start_capture_action (FpDevice *device)
+   else if (action == FPI_DEVICE_ACTION_ENROLL)
+     {
+       FpPrint *enroll_print = NULL;
++      FpImageDeviceClass *klass = FP_IMAGE_DEVICE_GET_CLASS (self);
+ 
+       fpi_device_get_enroll_data (device, &enroll_print);
+       g_object_get (enroll_print, "fpi-type", &print_type, NULL);
+-      if (print_type != FPI_PRINT_NBIS)
+-        fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
++      if (print_type == FPI_PRINT_UNDEFINED)
++        fpi_print_set_type (enroll_print,
++                            klass->enroll_image ? FPI_PRINT_RAW : FPI_PRINT_NBIS);
+     }
+ 
+   priv->enroll_stage = 0;
+diff --git a/libfprint/fpi-image-device.c b/libfprint/fpi-image-device.c
+index 8184d3a..1cc1c56 100644
+--- a/libfprint/fpi-image-device.c
++++ b/libfprint/fpi-image-device.c
+@@ -367,6 +367,79 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+     }
+ }
+ 
++static void
++fpi_image_device_custom_image_captured (FpImageDevice *self, FpImage *image)
++{
++  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
++  FpImageDeviceClass *klass = FP_IMAGE_DEVICE_GET_CLASS (self);
++  FpDevice *device = FP_DEVICE (self);
++  FpiDeviceAction action = fpi_device_get_current_action (device);
++  g_autoptr(FpImage) owned_image = image;
++  g_autoptr(GError) error = NULL;
++
++  /* Mirror completion of the asynchronous NBIS job.  The temporary active
++   * flag ensures state has moved to AWAIT_FINGER_OFF before enrollment can
++   * request final deactivation. */
++  priv->minutiae_scan_active = FALSE;
++
++  if (action == FPI_DEVICE_ACTION_CAPTURE)
++    {
++      priv->capture_image = g_steal_pointer (&owned_image);
++      fp_image_device_maybe_complete_action (self, NULL);
++      return;
++    }
++
++  if (action == FPI_DEVICE_ACTION_ENROLL)
++    {
++      FpPrint *enroll_print;
++      fpi_device_get_enroll_data (device, &enroll_print);
++      if (klass->enroll_image (self, enroll_print, owned_image, &error))
++        priv->enroll_stage++;
++
++      fpi_device_enroll_progress (device, priv->enroll_stage,
++                                  error ? NULL : enroll_print,
++                                  g_steal_pointer (&error));
++      if (priv->enroll_stage == fp_device_get_nr_enroll_stages (device))
++        {
++          fp_image_device_maybe_complete_action (self, NULL);
++          fpi_image_device_deactivate (self, FALSE);
++        }
++      else
++        fp_image_device_enroll_maybe_await_finger_on (self);
++      return;
++    }
++
++  if (action == FPI_DEVICE_ACTION_VERIFY)
++    {
++      FpPrint *template;
++      FpiMatchResult result;
++      fpi_device_get_verify_data (device, &template);
++      result = klass->match_image (self, template, owned_image, &error);
++      fpi_device_verify_report (device, result, NULL, g_steal_pointer (&error));
++      fp_image_device_maybe_complete_action (self, NULL);
++      return;
++    }
++
++  if (action == FPI_DEVICE_ACTION_IDENTIFY)
++    {
++      GPtrArray *templates;
++      FpPrint *match = NULL;
++      fpi_device_get_identify_data (device, &templates);
++      for (guint i = 0; i < templates->len && !error; i++)
++        if (klass->match_image (self, g_ptr_array_index (templates, i),
++                                owned_image, &error) == FPI_MATCH_SUCCESS)
++          {
++            match = g_ptr_array_index (templates, i);
++            break;
++          }
++      fpi_device_identify_report (device, match, NULL, g_steal_pointer (&error));
++      fp_image_device_maybe_complete_action (self, NULL);
++      return;
++    }
++
++  g_assert_not_reached ();
++}
++
+ /*********************************************************/
+ /* Private API */
+ 
+@@ -492,6 +565,15 @@ fpi_image_device_image_captured (FpImageDevice *self, FpImage *image)
+ 
+   g_debug ("Image device captured an image");
+ 
++  if (FP_IMAGE_DEVICE_GET_CLASS (self)->enroll_image &&
++      FP_IMAGE_DEVICE_GET_CLASS (self)->match_image)
++    {
++      priv->minutiae_scan_active = TRUE;
++      fp_image_device_change_state (self, FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF);
++      fpi_image_device_custom_image_captured (self, image);
++      return;
++    }
++
+   priv->minutiae_scan_active = TRUE;
+ 
+   /* XXX: We also detect minutiae in capture mode, we solely do this
+diff --git a/libfprint/fpi-image-device.h b/libfprint/fpi-image-device.h
+index 71472db..002f4d9 100644
+--- a/libfprint/fpi-image-device.h
++++ b/libfprint/fpi-image-device.h
+@@ -114,6 +114,19 @@ struct _FpImageDeviceClass
+   void          (*change_state) (FpImageDevice      *dev,
+                                  FpiImageDeviceState state);
+   void          (*deactivate)   (FpImageDevice *dev);
++
++  /* Optional matching path for small-area sensors whose images do not
++   * contain enough minutiae for NBIS.  The enrollment callback appends the
++   * image representation to @print; the match callback compares a captured
++   * image with a previously enrolled print. */
++  gboolean      (*enroll_image) (FpImageDevice *dev,
++                                 FpPrint       *print,
++                                 FpImage       *image,
++                                 GError       **error);
++  FpiMatchResult (*match_image) (FpImageDevice *dev,
++                                 FpPrint       *print,
++                                 FpImage       *image,
++                                 GError       **error);
+ };
+ 
+ void fpi_image_device_set_bz3_threshold (FpImageDevice *self,
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index ae0f6e2..94a6b9d 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -125,6 +125,8 @@ driver_sources = {
+         [ 'drivers/etes603.c' ],
+     'egis0570' :
+         [ 'drivers/egis0570.c' ],
++    'egis057e' :
++        [ 'drivers/egis057e.c' ],
+     'egismoc' :
+         [ 'drivers/egismoc/egismoc.c' ],
+     'vfs0050' :
+diff --git a/meson.build b/meson.build
+index 14fb11f..c5a89f8 100644
+--- a/meson.build
++++ b/meson.build
+@@ -130,6 +130,7 @@ default_drivers = [
+     'vfs0050',
+     'etes603',
+     'egis0570',
++    'egis057e',
+     'egismoc',
+     'vcom5s',
+     'synaptics',
+@@ -164,6 +165,7 @@ endian_independent_drivers = virtual_drivers + [
+     'aes3500',
+     'aes4000',
+     'egis0570',
++    'egis057e',
+     'egismoc',
+     'elanmoc',
+     'etes603',

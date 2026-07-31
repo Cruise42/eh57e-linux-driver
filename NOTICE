@@ -1,0 +1,9 @@
+The original driver and utility source files in src/ and tools/ are offered
+under the Zero-Clause BSD license in LICENSE.
+
+patches/libfprint-integration.patch modifies libfprint source code. libfprint
+is a separate project distributed under the GNU LGPL; that patch and any
+resulting libfprint binary remain subject to the applicable libfprint license.
+
+No vendor firmware, Windows driver binary, biometric template, fingerprint
+image, USB capture, credential, or machine-specific secret is included.
