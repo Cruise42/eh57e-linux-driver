@@ -23,6 +23,29 @@ method available.
 The matcher and automatic touch detector are empirical and tuned from a small
 sample set on one EH57E unit. Treat this as research-quality software.
 
+## Development environment
+
+The driver and experimental binary package were developed and tested on this
+platform:
+
+- System: Samsung Galaxy Book 360 Pro (`950QDB`, version `P12AKG`)
+- Operating system: Linux Mint 22.3 "Zena" (Ubuntu 24.04 Noble base)
+- Kernel: Linux `6.8.0-136-generic`, x86-64
+- Processor: 11th Gen Intel Core i7-1165G7 (4 cores, 8 threads, up to 4.7 GHz)
+- Memory: 15 GiB RAM with 2 GiB swap
+- Graphics: integrated Intel Iris Xe
+- Storage: 1 TB WD Black SN850X NVMe SSD
+- Wireless: Intel AX210 Wi-Fi 6E and Bluetooth
+- USB controllers: Intel USB 3.2 and Thunderbolt 4
+- Fingerprint reader: LighTuning/EgisTec EH57E (`1c7a:057e`), integrated with
+  the power button
+- Other relevant USB devices: Realtek RTS5129 card reader (`0bda:0129`) and a
+  generic 720p HD camera
+- Driver build baseline: libfprint 1.94.10 and glibc 2.39
+
+The published binary is specific to this tested x86-64 environment. Source
+compatibility and binary compatibility with other systems are not guaranteed.
+
 ## Repository layout
 
 ```text
