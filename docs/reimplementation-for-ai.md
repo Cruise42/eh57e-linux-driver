@@ -183,4 +183,6 @@ password fallback before graphical login or screen lock.
    descriptor supporting rotation and deformation.
 4. Add unit tests with synthetic/non-biometric fixtures.
 5. Turn the core callbacks into a reviewed upstream libfprint abstraction.
-6. Add runtime model/revision detection and safe protocol validation.
+6. Add runtime model/revision detection. Command responses are validated for
+   exact length, `SIGE` magic, and success status, but broader revision-specific
+   validation remains future work.

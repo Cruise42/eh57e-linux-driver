@@ -38,6 +38,7 @@
 #define EGIS057E_SECOND_MATCH_THRESHOLD 0.27
 #define EGIS057E_FRAME_CHANGE_MARGIN 0.10
 #define EGIS057E_SETTLING_FRAMES 8
+#define EGIS057E_RECOVERY_PKT_COUNT 4
 
 /* -------------------------------------------------------------------------
  * Device state
@@ -55,7 +56,6 @@ struct _FpDeviceEgis057e
   guint         init_step;        /* current index in egis057e_init[]   */
   guint         capture_step;     /* current index in capture sequence  */
   guint8        int_ep;           /* interrupt endpoint currently polled */
-  guint8       *resp_buf;         /* 4-byte response receive buffer      */
   guint8        previous_frame[EGIS057E_IMAGE_LEN];
   gboolean      have_previous_frame;
   gboolean      detection_armed;
@@ -68,6 +68,7 @@ struct _FpDeviceEgis057e
   double        change_threshold;
   gboolean      awaiting_release;
   gboolean      reported_image;
+  gboolean      capture_protocol_error;
 };
 
 G_DECLARE_FINAL_TYPE (FpDeviceEgis057e, fpi_device_egis057e,
@@ -225,9 +226,40 @@ static void
 cmd_resp_cb (FpiUsbTransfer *transfer, FpDevice *dev,
              gpointer user_data, GError *error)
 {
+  guint expected_length = GPOINTER_TO_UINT (user_data);
+
   if (error)
     {
       fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  if (transfer->actual_length != expected_length)
+    {
+      fpi_ssm_mark_failed (
+        transfer->ssm,
+        fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                  "Unexpected command response length %zd (expected %u)",
+                                  transfer->actual_length, expected_length));
+      return;
+    }
+
+  if (transfer->actual_length < EGIS057E_RESP_LEN ||
+      memcmp (transfer->buffer, "SIGE", 4) != 0)
+    {
+      fpi_ssm_mark_failed (transfer->ssm,
+                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                     "Malformed command response"));
+      return;
+    }
+
+  if (transfer->buffer[6] != 0x01)
+    {
+      fpi_ssm_mark_failed (
+        transfer->ssm,
+        fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                  "Device rejected command (status 0x%02x)",
+                                  transfer->buffer[6]));
       return;
     }
 
@@ -276,10 +308,11 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 
   if (transfer->actual_length < EGIS057E_IMAGE_LEN)
     {
-      egis057e_log_bytes ("short image payload: ", transfer->buffer,
-                          transfer->actual_length);
+      fp_warn ("short image payload: received %zd/%d bytes",
+               transfer->actual_length, EGIS057E_IMAGE_LEN);
       fpi_image_device_report_finger_status (img_dev, FALSE);
-      fpi_ssm_jump_to_state (transfer->ssm, SM_DETECT_WAIT);
+      self->capture_protocol_error = TRUE;
+      fpi_ssm_jump_to_state (transfer->ssm, SM_CAPTURE_FINISH);
       return;
     }
 
@@ -401,8 +434,9 @@ recv_command_response (FpiSsm *ssm, FpDevice *dev, guint length)
 
   fpi_usb_transfer_fill_bulk (t, EGIS057E_EP_IN, length);
   t->ssm = ssm;
-  t->short_is_error = FALSE;
-  fpi_usb_transfer_submit (t, EGIS057E_TIMEOUT_CMD, NULL, cmd_resp_cb, NULL);
+  t->short_is_error = TRUE;
+  fpi_usb_transfer_submit (t, EGIS057E_TIMEOUT_CMD, NULL, cmd_resp_cb,
+                           GUINT_TO_POINTER (length));
 }
 
 static void
@@ -460,9 +494,10 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
     /* --- Init phase ---------------------------------------------------- */
 
     case SM_INIT_SEND:
-      if (self->image_initialized && self->init_step == 0)
+      if (self->image_initialized &&
+          self->init_step == EGIS057E_RECOVERY_PKT_COUNT)
         {
-          fp_dbg ("reusing calibrated image path");
+          fp_dbg ("recovery complete; reusing calibrated image path");
           if (!self->activated)
             {
               self->activated = TRUE;
@@ -594,6 +629,15 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 
     case SM_DETECT_DONE:
       self->capture_step = 0;
+      if (self->capture_protocol_error)
+        {
+          self->capture_protocol_error = FALSE;
+          fpi_ssm_mark_failed (
+            ssm,
+            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                      "Short live image; capture transaction closed"));
+          break;
+        }
       if (self->reported_image &&
           fpi_device_get_current_action (dev) != FPI_DEVICE_ACTION_ENROLL)
         fpi_image_device_report_finger_status (img_dev, FALSE);
@@ -620,6 +664,7 @@ loop_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   if (error)
     {
+      self->image_initialized = FALSE;
       if (!self->activated)
         {
           self->activated = TRUE;
@@ -645,7 +690,6 @@ dev_init (FpImageDevice *dev)
   g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
                                 0, 0, &error);
 
-  self->resp_buf = g_malloc (EGIS057E_RESP_LEN);
   self->image_initialized = FALSE;
 
   fpi_image_device_open_complete (dev, error);
@@ -655,10 +699,6 @@ static void
 dev_deinit (FpImageDevice *dev)
 {
   GError           *error = NULL;
-  FpDeviceEgis057e *self  = FPI_DEVICE_EGIS057E (dev);
-
-  g_clear_pointer (&self->resp_buf, g_free);
-
   g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
                                    0, 0, &error);
 
@@ -686,6 +726,7 @@ dev_activate (FpImageDevice *dev)
   self->change_threshold = 0.0;
   self->awaiting_release = FALSE;
   self->reported_image = FALSE;
+  self->capture_protocol_error = FALSE;
 
   ssm = fpi_ssm_new (FP_DEVICE (dev), ssm_run_state, SM_STATES_NUM);
   fpi_ssm_start (ssm, loop_complete);

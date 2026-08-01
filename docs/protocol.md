@@ -41,7 +41,8 @@ used during calibration and is not interchangeable with normal capture.
 
 ## Recovery and image calibration
 
-The driver sends this recovery prefix on the first activation:
+The driver sends this recovery prefix on every activation. When calibration is
+still valid, it reuses that calibration only after the recovery prefix succeeds:
 
 1. `write_u8(0x0a, 0xf4)`
 2. `write_u8(0x0c, 0x44)`
