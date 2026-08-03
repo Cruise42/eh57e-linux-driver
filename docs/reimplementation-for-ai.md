@@ -105,12 +105,14 @@ Instead:
 7. require two consecutive above-threshold comparisons;
 8. wait three more frames for full contact;
 9. submit the final frame to matching;
-10. for enrollment, require three consecutive below-threshold comparisons
-    before reporting finger-off.
+10. for every captured action, retain the accepted finger frame and require two
+    consecutive frames that differ substantially from it before reporting
+    finger-off. Do not infer removal from low inter-frame activity: both a
+    held finger and an empty sensor are temporally stable.
 
-The activation must begin while the sensor is clear. If a finger is already
-present during baseline acquisition, removal can resemble placement. A future
-driver should solve this with a non-destructive hardware detect configuration.
+If initial activity is substantially above the measured empty-sensor range,
+treat the finger as already present and proceed through contact settling. This
+handles lock screens that activate the reader after the user has touched it.
 
 ### Phase 7: completion ordering
 
@@ -120,7 +122,9 @@ processing:
 1. mark scan processing active;
 2. move image state to `AWAIT_FINGER_OFF`;
 3. clear processing-active inside custom processing;
-4. report enrollment progress or verify/identify result;
+4. report enrollment progress or verify/identify result, while requiring a
+   physical release after every action because an identify duplicate check may
+   be chained directly into enrollment;
 5. request final deactivation only after the state change.
 
 The wrong order caused final enrollment to enter an invalid state transition

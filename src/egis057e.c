@@ -38,7 +38,10 @@
 #define EGIS057E_SECOND_MATCH_THRESHOLD 0.27
 #define EGIS057E_FRAME_CHANGE_MARGIN 0.10
 #define EGIS057E_SETTLING_FRAMES 8
-#define EGIS057E_RECOVERY_PKT_COUNT 4
+#define EGIS057E_RELEASE_MIN_DIFFERENCE 10.0
+#define EGIS057E_RELEASE_THRESHOLD_MULTIPLIER 3.0
+#define EGIS057E_RELEASE_FRAMES 2
+#define EGIS057E_INITIAL_TOUCH_THRESHOLD 3.0
 
 /* -------------------------------------------------------------------------
  * Device state
@@ -51,17 +54,18 @@ struct _FpDeviceEgis057e
   gboolean      running;
   gboolean      stop;
   gboolean      activated;
-  gboolean      image_initialized;
 
   guint         init_step;        /* current index in egis057e_init[]   */
   guint         capture_step;     /* current index in capture sequence  */
   guint8        int_ep;           /* interrupt endpoint currently polled */
   guint8        previous_frame[EGIS057E_IMAGE_LEN];
+  guint8        captured_frame[EGIS057E_IMAGE_LEN];
   gboolean      have_previous_frame;
+  gboolean      have_captured_frame;
   gboolean      detection_armed;
   guint         stable_frames;
   guint         finger_frames;
-  guint         clear_frames;
+  guint         release_frames;
   guint         touch_settle_frames;
   gboolean      touch_pending;
   double        baseline_sum;
@@ -291,6 +295,16 @@ calibration_image_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 }
 
 static void
+frame_mean_difference (const guint8 *a, const guint8 *b, double *result)
+{
+  guint64 difference = 0;
+
+  for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
+    difference += ABS ((gint) a[i] - (gint) b[i]);
+  *result = (double) difference / EGIS057E_IMAGE_LEN;
+}
+
+static void
 image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                gpointer user_data, GError *error)
 {
@@ -324,13 +338,10 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
     }
   else
     {
-      guint64 difference = 0;
       double mean_difference;
 
-      for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
-        difference += ABS ((gint) transfer->buffer[i] -
-                           (gint) self->previous_frame[i]);
-      mean_difference = (double) difference / EGIS057E_IMAGE_LEN;
+      frame_mean_difference (transfer->buffer, self->previous_frame,
+                             &mean_difference);
       memcpy (self->previous_frame, transfer->buffer, EGIS057E_IMAGE_LEN);
       if (!self->detection_armed)
         {
@@ -338,27 +349,53 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
           self->stable_frames++;
           if (self->stable_frames >= EGIS057E_SETTLING_FRAMES)
             {
+              double initial_activity =
+                self->baseline_sum / self->stable_frames;
+
               self->detection_armed = TRUE;
-              self->change_threshold =
-                self->baseline_sum / self->stable_frames +
-                EGIS057E_FRAME_CHANGE_MARGIN;
+              self->change_threshold = initial_activity +
+                                       EGIS057E_FRAME_CHANGE_MARGIN;
               fp_dbg ("automatic finger detection armed: clear baseline %.4f, threshold %.4f",
-                      self->baseline_sum / self->stable_frames,
+                      initial_activity,
                       self->change_threshold);
+
+              /* Lock screens may start PAM after the user has already put a
+               * finger down. Such an activation has much higher initial
+               * temporal activity than the empty sensor, so treat it as an
+               * in-progress contact instead of calibrating it away. */
+              if (initial_activity >= EGIS057E_INITIAL_TOUCH_THRESHOLD)
+                {
+                  self->touch_settle_frames = 3;
+                  self->touch_pending = TRUE;
+                  fp_dbg ("initial activity indicates finger already present; waiting for stable contact");
+                }
             }
         }
       else if (self->awaiting_release)
         {
-          if (mean_difference <= self->change_threshold)
-            self->clear_frames++;
-          else
-            self->clear_frames = 0;
+          double captured_difference;
+          double release_threshold =
+            MAX (EGIS057E_RELEASE_MIN_DIFFERENCE,
+                 self->change_threshold *
+                 EGIS057E_RELEASE_THRESHOLD_MULTIPLIER);
 
-          if (self->clear_frames >= 3)
+          g_assert (self->have_captured_frame);
+          frame_mean_difference (transfer->buffer, self->captured_frame,
+                                 &captured_difference);
+          if (captured_difference >= release_threshold)
+            self->release_frames++;
+          else
+            self->release_frames = 0;
+
+          fp_dbg ("finger-release difference %.4f, threshold %.4f, frames %u/%u",
+                  captured_difference, release_threshold,
+                  self->release_frames, EGIS057E_RELEASE_FRAMES);
+          if (self->release_frames >= EGIS057E_RELEASE_FRAMES)
             {
-              fp_dbg ("temporal activity stayed below threshold; finger removed");
+              fp_dbg ("captured finger no longer present; reporting removal");
               self->awaiting_release = FALSE;
-              self->clear_frames = 0;
+              self->release_frames = 0;
+              self->have_captured_frame = FALSE;
               fpi_image_device_report_finger_status (img_dev, FALSE);
             }
         }
@@ -398,10 +435,16 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               fp_dbg ("temporal activity exceeded threshold; reporting automatic finger placement");
               self->touch_pending = FALSE;
               self->finger_frames = 0;
+              memcpy (self->captured_frame, transfer->buffer,
+                      EGIS057E_IMAGE_LEN);
+              self->have_captured_frame = TRUE;
               fpi_image_device_report_finger_status (img_dev, TRUE);
               self->reported_image = TRUE;
-              self->awaiting_release =
-                fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL;
+              /* Require physical removal after every capture. fprintd may
+               * chain an IDENTIFY duplicate check directly into ENROLL; a
+               * synthetic finger-off would let enrollment calibrate while
+               * the finger is still on the sensor. */
+              self->awaiting_release = TRUE;
               fpi_image_device_image_captured (img_dev, g_steal_pointer (&img));
             }
         }
@@ -494,22 +537,9 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
     /* --- Init phase ---------------------------------------------------- */
 
     case SM_INIT_SEND:
-      if (self->image_initialized &&
-          self->init_step == EGIS057E_RECOVERY_PKT_COUNT)
-        {
-          fp_dbg ("recovery complete; reusing calibrated image path");
-          if (!self->activated)
-            {
-              self->activated = TRUE;
-              fpi_image_device_activate_complete (img_dev, NULL);
-            }
-          fpi_ssm_jump_to_state (ssm, SM_CAPTURE_DELAY);
-          break;
-        }
       if (self->init_step >= G_N_ELEMENTS (egis057e_init_pkts))
         {
           fp_dbg ("image-path init complete; starting automatic frame-change detection");
-          self->image_initialized = TRUE;
           if (!self->activated)
             {
               self->activated = TRUE;
@@ -638,9 +668,6 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
                                       "Short live image; capture transaction closed"));
           break;
         }
-      if (self->reported_image &&
-          fpi_device_get_current_action (dev) != FPI_DEVICE_ACTION_ENROLL)
-        fpi_image_device_report_finger_status (img_dev, FALSE);
       self->reported_image = FALSE;
       fpi_ssm_jump_to_state (ssm, SM_CAPTURE_DELAY);
       break;
@@ -664,7 +691,6 @@ loop_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   if (error)
     {
-      self->image_initialized = FALSE;
       if (!self->activated)
         {
           self->activated = TRUE;
@@ -685,12 +711,8 @@ static void
 dev_init (FpImageDevice *dev)
 {
   GError           *error = NULL;
-  FpDeviceEgis057e *self  = FPI_DEVICE_EGIS057E (dev);
-
   g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
                                 0, 0, &error);
-
-  self->image_initialized = FALSE;
 
   fpi_image_device_open_complete (dev, error);
 }
@@ -716,10 +738,11 @@ dev_activate (FpImageDevice *dev)
   self->activated = FALSE;
   self->int_ep    = EGIS057E_EP_INT_FINGER;
   self->have_previous_frame = FALSE;
+  self->have_captured_frame = FALSE;
   self->detection_armed = FALSE;
   self->stable_frames = 0;
   self->finger_frames = 0;
-  self->clear_frames = 0;
+  self->release_frames = 0;
   self->touch_settle_frames = 0;
   self->touch_pending = FALSE;
   self->baseline_sum = 0.0;

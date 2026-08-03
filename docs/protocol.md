@@ -108,8 +108,10 @@ The current driver consequently uses temporal image activity:
 - threshold at baseline + `0.10`;
 - require two above-threshold frames;
 - wait three additional frames before matching;
-- during enrollment, require three below-threshold frames before reporting
-  finger removal.
+- after every captured action, retain the accepted finger frame and require two frames
+  that differ substantially from it before reporting finger removal; low
+  inter-frame activity alone cannot distinguish a held finger from an empty
+  sensor.
 
 This is empirical and must be retuned or replaced if another unit behaves
 differently.

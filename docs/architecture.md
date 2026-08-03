@@ -88,10 +88,26 @@ Eight frames establish a per-activation baseline. Two consecutive frames over
 baseline + 0.10 start a three-frame contact-settling period. The final settled
 frame is delivered to the matcher.
 
-For verify/identify, the driver can report finger-off immediately after the
-captured frame. During multi-stage enrollment, it keeps sampling until three
-consecutive frames fall below the activity threshold, preventing one held
-finger from filling multiple enrollment stages.
+If the initial eight-frame activity is substantially above the measured empty
+sensor range, the driver treats the finger as already present and enters the
+contact-settling period directly. This supports lock screens where the user can
+touch the reader before PAM has finished activating it.
+
+Every image-device activation runs the complete initialization sequence. The
+short four-command recovery prefix resets command state but does not reliably
+restore live-image updates after an identify-to-enroll transition; reapplying
+normal image mode and the image-window registers does.
+
+After every capture, including verify/identify, the driver retains the accepted
+finger frame and keeps sampling until two consecutive frames differ
+substantially from it. This matters because fprintd can chain an IDENTIFY
+duplicate check directly into ENROLL: a synthetic finger-off would allow the
+enrollment activation to calibrate while the finger is still present.
+Comparing against the captured image, rather than merely looking for low
+inter-frame activity, also distinguishes a held-but-stable finger from the
+clear sensor after removal.
+The minimum release difference is deliberately above the measured long-hold
+drift (about 5.5 intensity units); a physical lift measured about 34.7 units.
 
 ## Core completion ordering
 
