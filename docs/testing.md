@@ -76,3 +76,34 @@ If the reader stops responding:
 4. if necessary, reboot with the sensor untouched during startup.
 
 Remove the systemd override to return fprintd to the distribution library.
+
+## 8. Diagnosing detection versus matching
+
+Enable verbose fprintd/libfprint logging only for a short reproduction. A
+runtime systemd drop-in avoids making diagnostics persistent:
+
+```ini
+# /run/systemd/system/fprintd.service.d/eh57e-debug.conf
+[Service]
+Environment=G_MESSAGES_DEBUG=all
+```
+
+Reload systemd, restart fprintd, reproduce once, and inspect the fprintd unit
+journal. Relevant messages include baseline activity, initial-contact
+detection, contact transitions, release differences, matcher scores, and the
+final verify result.
+
+- No verification start indicates a desktop or PAM integration problem.
+- No contact transition indicates touch-detection or sensor-state trouble.
+- A captured image followed by `verify-no-match` indicates matcher/placement
+  sensitivity rather than a failure to recognize the touch.
+- A first action that works followed by unchanged frames suggests the sensor's
+  image mode was not fully restored on reactivation.
+
+Remove the runtime drop-in, reload systemd, and restart fprintd immediately
+after the test. Diagnostic logging must never include raw fingerprint frames or
+stored templates.
+
+For interactive testing, explicitly prompt the operator to place or remove the
+finger and wait for an `OK` response at every step. This keeps human timing
+separate from driver timing and makes journal evidence interpretable.
