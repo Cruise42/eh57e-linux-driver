@@ -96,9 +96,11 @@ the final uninterrupted stable run, it retains the frame with the strongest
 combined gradient and intensity-range quality score.
 
 If the initial eight-frame activity is substantially above the measured empty
-sensor range, the driver treats the finger as already present and enters the
-contact-settling period directly. This supports lock screens where the user can
-touch the reader before PAM has finished activating it.
+sensor range, or the retained frame has the spatial ridge energy and contrast
+of a fingerprint, the driver treats the finger as already present and enters
+the contact-settling period directly. The spatial check covers a finger held
+completely still before PAM activates the reader; temporal activity alone
+would incorrectly learn that image as the clear-sensor baseline.
 
 Every image-device activation runs the complete initialization sequence. The
 short four-command recovery prefix resets command state but does not reliably

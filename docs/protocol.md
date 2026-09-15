@@ -105,6 +105,8 @@ The current driver consequently uses temporal image activity:
 - acquire and discard initial settling frames;
 - calculate mean absolute difference from the preceding frame;
 - learn an activation-specific clear baseline;
+- distinguish a stationary finger present during baseline collection using
+  gradient energy plus intensity spread before accepting a clear reference;
 - threshold at baseline + `0.10`;
 - require two above-threshold frames;
 - require three consecutive low-motion frames (mean difference at most `2.0`)

@@ -49,6 +49,9 @@
 #define EGIS057E_MIN_IMAGE_STDDEV 15.0
 #define EGIS057E_MIN_GRADIENT_RMS 30.0
 #define EGIS057E_MIN_INTENSITY_RANGE 30
+#define EGIS057E_INITIAL_FINGER_MIN_STDDEV 65.0
+#define EGIS057E_INITIAL_FINGER_MIN_GRADIENT_RMS 38.0
+#define EGIS057E_INITIAL_FINGER_MIN_INTENSITY_RANGE 200
 
 /* -------------------------------------------------------------------------
  * Device state
@@ -405,6 +408,15 @@ image_quality_acceptable (const Egis057eImageQuality *quality)
          quality->intensity_range >= EGIS057E_MIN_INTENSITY_RANGE;
 }
 
+static gboolean
+initial_frame_has_finger (const Egis057eImageQuality *quality)
+{
+  return quality->gradient_rms >= EGIS057E_INITIAL_FINGER_MIN_GRADIENT_RMS &&
+         (quality->standard_deviation >= EGIS057E_INITIAL_FINGER_MIN_STDDEV ||
+          quality->intensity_range >=
+            EGIS057E_INITIAL_FINGER_MIN_INTENSITY_RANGE);
+}
+
 static void
 image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                gpointer user_data, GError *error)
@@ -452,6 +464,11 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
             {
               double initial_activity =
                 self->baseline_sum / self->stable_frames;
+              Egis057eImageQuality initial_quality =
+                image_quality (transfer->buffer);
+              gboolean initial_finger =
+                initial_activity >= EGIS057E_INITIAL_TOUCH_THRESHOLD ||
+                initial_frame_has_finger (&initial_quality);
 
               self->detection_armed = TRUE;
               self->change_threshold = initial_activity +
@@ -459,8 +476,13 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               fp_dbg ("automatic finger detection armed: clear baseline %.4f, threshold %.4f",
                       initial_activity,
                       self->change_threshold);
+              fp_dbg ("initial retained-frame quality: stddev %.2f, gradient %.2f, range %u, mean-independent score %.2f",
+                      initial_quality.standard_deviation,
+                      initial_quality.gradient_rms,
+                      initial_quality.intensity_range,
+                      initial_quality.score);
 
-              if (initial_activity < EGIS057E_INITIAL_TOUCH_THRESHOLD)
+              if (!initial_finger)
                 {
                   memcpy (self->clear_frame, transfer->buffer,
                           EGIS057E_IMAGE_LEN);
@@ -468,17 +490,18 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                 }
 
               /* Lock screens may start PAM after the user has already put a
-               * finger down. Such an activation has much higher initial
-               * temporal activity than the empty sensor, so treat it as an
-               * in-progress contact instead of calibrating it away. */
-              if (initial_activity >= EGIS057E_INITIAL_TOUCH_THRESHOLD)
+               * finger down. Detect that either from temporal activity or
+               * from spatial ridge energy and contrast; a completely still
+               * finger otherwise looks like a clear temporal baseline. */
+              if (initial_finger)
                 {
                   self->touch_settle_frames = 0;
                   self->touch_stable_frames = 0;
                   self->touch_best_difference = G_MAXDOUBLE;
+                  self->touch_best_quality = -1.0;
                   self->have_touch_best_frame = FALSE;
                   self->touch_pending = TRUE;
-                  fp_dbg ("initial activity indicates finger already present; waiting for stable contact");
+                  fp_dbg ("initial temporal/spatial signature indicates finger already present; waiting for stable contact");
                 }
             }
         }
