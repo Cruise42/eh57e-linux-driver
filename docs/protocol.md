@@ -63,9 +63,9 @@ The confirmed image calibration phase is:
 10. request and drain one 3990-byte image using opcode `0x72`
 11. `write_u8(0x54, 0x00)`
 
-The development snapshot currently uses the empirically stable calibration
-sample `0x6d` in its static initialization table. A production-quality version
-should propagate the runtime byte returned by step 4.
+The driver propagates the runtime byte returned by step 4 into step 5. The
+empirically stable value `0x6d` remains only as the initialization-table
+fallback if no valid response has been received.
 
 ## Normal image mode
 
@@ -107,10 +107,14 @@ The current driver consequently uses temporal image activity:
 - learn an activation-specific clear baseline;
 - threshold at baseline + `0.10`;
 - require two above-threshold frames;
-- wait three additional frames before matching;
-- after every captured action, retain the accepted finger frame and require two frames
-  that differ substantially from it before reporting finger removal; low
-  inter-frame activity alone cannot distinguish a held finger from an empty
+- require three consecutive low-motion frames (mean difference at most `2.0`)
+  before matching, with an eight-frame maximum settling window;
+- retain the best-quality frame from the final uninterrupted stable run;
+- report a retryable too-fast scan instead of matching if the contact does not
+  stabilize within the bounded window;
+- after every captured action, compare against the learned clear-sensor frame
+  and require two sufficiently similar frames before reporting finger removal;
+  low inter-frame activity alone cannot distinguish a held finger from an empty
   sensor.
 
 This is empirical and must be retuned or replaced if another unit behaves

@@ -18,8 +18,8 @@ encrypted-disk credentials available.
 - The matcher searches translation but not rotation, nonlinear distortion,
   pressure deformation, or liveness.
 - There is no spoof or presentation-attack detection.
-- The calibration table still contains one static empirical byte that should
-  be populated dynamically from the sensor response.
+- Runtime calibration is propagated from the sensor; `0x6d` remains a fallback
+  only if the calibration response is unavailable.
 - libfprint core is patched because its standard image pipeline assumes NBIS.
 - A distribution libfprint update may break the patch or replace a local build.
 - The sensor is integrated with a power button on some laptops. Rest a finger
@@ -48,7 +48,8 @@ Keep a root console or recovery environment available while testing.
 
 PAM interfaces differ. Cinnamon displays its normal password field while
 fingerprint verification runs in the background; there may be no dedicated
-fingerprint dialog. Full-disk encryption, firmware authentication, remote SSH
+fingerprint dialog. It may also retry a rejected scan without displaying an
+intermediate failure/reposition message. Full-disk encryption, firmware authentication, remote SSH
 keys, and non-PAM applications are outside this driver's scope.
 
 ## Responsible testing

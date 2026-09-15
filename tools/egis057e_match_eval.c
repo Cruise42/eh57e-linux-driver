@@ -20,7 +20,7 @@ read_frame (const char *path, unsigned char *image, long offset)
   return ok;
 }
 
-/* Zero-mean normalized cross correlation, maximizing over translations. */
+/* Normalized vector-gradient correlation, maximizing over translations. */
 static double
 score (const unsigned char *a, const unsigned char *b, int *best_dx, int *best_dy)
 {
@@ -28,28 +28,26 @@ score (const unsigned char *a, const unsigned char *b, int *best_dx, int *best_d
   for (int dy = -12; dy <= 12; dy++)
     for (int dx = -12; dx <= 12; dx++)
       {
-        double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
-        int count = 0;
+        double energy_a = 0, energy_b = 0, dot_product = 0;
         for (int y = 4; y < H - 4; y++)
           for (int x = 4; x < W - 4; x++)
             {
               int bx = x + dx, by = y + dy;
-              double va, vb;
+              double ax, ay, bx_gradient, by_gradient;
               if (bx < 4 || bx >= W - 4 || by < 4 || by >= H - 4)
                 continue;
-              /* Horizontal and vertical gradients suppress illumination. */
-              va = (a[y * W + x + 1] - a[y * W + x - 1]) +
-                   (a[(y + 1) * W + x] - a[(y - 1) * W + x]);
-              vb = (b[by * W + bx + 1] - b[by * W + bx - 1]) +
-                   (b[(by + 1) * W + bx] - b[(by - 1) * W + bx]);
-              sa += va; sb += vb; saa += va * va; sbb += vb * vb;
-              sab += va * vb; count++;
+              ax = a[y * W + x + 1] - a[y * W + x - 1];
+              ay = a[(y + 1) * W + x] - a[(y - 1) * W + x];
+              bx_gradient = b[by * W + bx + 1] - b[by * W + bx - 1];
+              by_gradient = b[(by + 1) * W + bx] - b[(by - 1) * W + bx];
+              dot_product += ax * bx_gradient + ay * by_gradient;
+              energy_a += ax * ax + ay * ay;
+              energy_b += bx_gradient * bx_gradient +
+                          by_gradient * by_gradient;
             }
         {
-          double numerator = sab - sa * sb / count;
-          double denominator = sqrt ((saa - sa * sa / count) *
-                                     (sbb - sb * sb / count));
-          double value = denominator > 0 ? numerator / denominator : -1;
+          double denominator = sqrt (energy_a * energy_b);
+          double value = denominator > 0 ? dot_product / denominator : -1;
           if (value > best)
             { best = value; *best_dx = dx; *best_dy = dy; }
         }

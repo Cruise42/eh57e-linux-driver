@@ -103,8 +103,10 @@ Instead:
 5. threshold at baseline + 0.10;
 6. slowly adapt baseline on below-threshold samples;
 7. require two consecutive above-threshold comparisons;
-8. wait three more frames for full contact;
-9. submit the final frame to matching;
+8. wait for three consecutive comparisons at or below a `2.0` mean difference;
+9. retain the lowest-motion frame in the settling window and submit it after
+   stability, or after eight frames so motion cannot delay authentication
+   indefinitely;
 10. for every captured action, retain the accepted finger frame and require two
     consecutive frames that differ substantially from it before reporting
     finger-off. Do not infer removal from low inter-frame activity: both a
@@ -181,9 +183,10 @@ password fallback before graphical login or screen lock.
 
 ## Suggested future improvements
 
-1. Dynamically propagate the calibration sample.
-2. Find a working hardware touch mode that preserves image calibration.
-3. Replace the simple gradient correlation with a tested small-area fingerprint
+1. Find a working hardware touch mode that preserves image calibration.
+2. Add controlled genuine/impostor datasets to validate the runtime calibration,
+   image-quality gates, and vector-gradient matcher.
+3. Extend the vector-gradient correlation with a tested small-area fingerprint
    descriptor supporting rotation and deformation.
 4. Add unit tests with synthetic/non-biometric fixtures.
 5. Turn the core callbacks into a reviewed upstream libfprint abstraction.

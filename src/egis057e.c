@@ -34,14 +34,21 @@
 
 #include "egis057e.h"
 
-#define EGIS057E_MATCH_THRESHOLD 0.34
-#define EGIS057E_SECOND_MATCH_THRESHOLD 0.27
+#define EGIS057E_MATCH_THRESHOLD 0.30
+#define EGIS057E_SECOND_MATCH_THRESHOLD 0.23
+#define EGIS057E_ENROLL_DUPLICATE_THRESHOLD 0.92
 #define EGIS057E_FRAME_CHANGE_MARGIN 0.10
 #define EGIS057E_SETTLING_FRAMES 8
 #define EGIS057E_RELEASE_MIN_DIFFERENCE 10.0
 #define EGIS057E_RELEASE_THRESHOLD_MULTIPLIER 3.0
 #define EGIS057E_RELEASE_FRAMES 2
 #define EGIS057E_INITIAL_TOUCH_THRESHOLD 3.0
+#define EGIS057E_TOUCH_STABLE_MAX_DIFFERENCE 2.0
+#define EGIS057E_TOUCH_STABLE_FRAMES 3
+#define EGIS057E_TOUCH_SETTLE_MAX_FRAMES 8
+#define EGIS057E_MIN_IMAGE_STDDEV 15.0
+#define EGIS057E_MIN_GRADIENT_RMS 30.0
+#define EGIS057E_MIN_INTENSITY_RANGE 30
 
 /* -------------------------------------------------------------------------
  * Device state
@@ -60,16 +67,25 @@ struct _FpDeviceEgis057e
   guint8        int_ep;           /* interrupt endpoint currently polled */
   guint8        previous_frame[EGIS057E_IMAGE_LEN];
   guint8        captured_frame[EGIS057E_IMAGE_LEN];
+  guint8        clear_frame[EGIS057E_IMAGE_LEN];
+  guint8        touch_best_frame[EGIS057E_IMAGE_LEN];
   gboolean      have_previous_frame;
   gboolean      have_captured_frame;
+  gboolean      have_clear_frame;
+  gboolean      have_touch_best_frame;
   gboolean      detection_armed;
   guint         stable_frames;
   guint         finger_frames;
   guint         release_frames;
   guint         touch_settle_frames;
+  guint         touch_stable_frames;
   gboolean      touch_pending;
   double        baseline_sum;
   double        change_threshold;
+  double        touch_best_difference;
+  double        touch_best_quality;
+  guint8        calibration_sample;
+  gboolean      have_calibration_sample;
   gboolean      awaiting_release;
   gboolean      reported_image;
   gboolean      capture_protocol_error;
@@ -230,6 +246,7 @@ static void
 cmd_resp_cb (FpiUsbTransfer *transfer, FpDevice *dev,
              gpointer user_data, GError *error)
 {
+  FpDeviceEgis057e *self = FPI_DEVICE_EGIS057E (dev);
   guint expected_length = GPOINTER_TO_UINT (user_data);
 
   if (error)
@@ -269,6 +286,20 @@ cmd_resp_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 
   egis057e_log_bytes ("command response: ", transfer->buffer,
                       transfer->actual_length);
+
+  /* read_buf(0x67, 3) returns the per-activation calibration sample as
+   * the first payload byte.  Keep it per device instance and substitute it
+   * into the following write_buf(0x33, ...) command. */
+  if (self->init_step < G_N_ELEMENTS (egis057e_init_pkts) &&
+      egis057e_init_pkts[self->init_step].bytes[4] == 0x62 &&
+      egis057e_init_pkts[self->init_step].bytes[5] == 0x67 &&
+      transfer->actual_length >= EGIS057E_RESP_LEN + 1)
+    {
+      self->calibration_sample = transfer->buffer[EGIS057E_RESP_LEN];
+      self->have_calibration_sample = TRUE;
+      fp_dbg ("runtime image calibration sample: 0x%02x",
+              self->calibration_sample);
+    }
   fpi_ssm_next_state (transfer->ssm);
 }
 
@@ -302,6 +333,76 @@ frame_mean_difference (const guint8 *a, const guint8 *b, double *result)
   for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
     difference += ABS ((gint) a[i] - (gint) b[i]);
   *result = (double) difference / EGIS057E_IMAGE_LEN;
+}
+
+typedef struct
+{
+  double standard_deviation;
+  double gradient_rms;
+  guint intensity_range;
+  double score;
+} Egis057eImageQuality;
+
+static Egis057eImageQuality
+image_quality (const guint8 *image)
+{
+  Egis057eImageQuality quality = { 0 };
+  guint histogram[256] = { 0 };
+  guint64 sum = 0, squared_sum = 0, gradient_squared_sum = 0;
+  guint gradient_count = 0, below = 0;
+  guint low = 0, high = 255;
+
+  for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
+    {
+      guint value = image[i];
+      histogram[value]++;
+      sum += value;
+      squared_sum += value * value;
+    }
+
+  for (guint y = 1; y + 1 < EGIS057E_IMAGE_HEIGHT; y++)
+    for (guint x = 1; x + 1 < EGIS057E_IMAGE_WIDTH; x++)
+      {
+        gint gx = image[y * EGIS057E_IMAGE_WIDTH + x + 1] -
+                  image[y * EGIS057E_IMAGE_WIDTH + x - 1];
+        gint gy = image[(y + 1) * EGIS057E_IMAGE_WIDTH + x] -
+                  image[(y - 1) * EGIS057E_IMAGE_WIDTH + x];
+        gradient_squared_sum += gx * gx + gy * gy;
+        gradient_count++;
+      }
+
+  for (low = 0; low < 255; low++)
+    {
+      below += histogram[low];
+      if (below >= EGIS057E_IMAGE_LEN / 20)
+        break;
+    }
+  below = 0;
+  for (high = 255; high > 0; high--)
+    {
+      below += histogram[high];
+      if (below >= EGIS057E_IMAGE_LEN / 20)
+        break;
+    }
+
+  {
+    double mean = (double) sum / EGIS057E_IMAGE_LEN;
+    double variance = (double) squared_sum / EGIS057E_IMAGE_LEN - mean * mean;
+
+    quality.standard_deviation = sqrt (MAX (variance, 0.0));
+  }
+  quality.gradient_rms = sqrt ((double) gradient_squared_sum / gradient_count);
+  quality.intensity_range = high > low ? high - low : 0;
+  quality.score = quality.gradient_rms + quality.intensity_range;
+  return quality;
+}
+
+static gboolean
+image_quality_acceptable (const Egis057eImageQuality *quality)
+{
+  return quality->standard_deviation >= EGIS057E_MIN_IMAGE_STDDEV &&
+         quality->gradient_rms >= EGIS057E_MIN_GRADIENT_RMS &&
+         quality->intensity_range >= EGIS057E_MIN_INTENSITY_RANGE;
 }
 
 static void
@@ -359,13 +460,23 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                       initial_activity,
                       self->change_threshold);
 
+              if (initial_activity < EGIS057E_INITIAL_TOUCH_THRESHOLD)
+                {
+                  memcpy (self->clear_frame, transfer->buffer,
+                          EGIS057E_IMAGE_LEN);
+                  self->have_clear_frame = TRUE;
+                }
+
               /* Lock screens may start PAM after the user has already put a
                * finger down. Such an activation has much higher initial
                * temporal activity than the empty sensor, so treat it as an
                * in-progress contact instead of calibrating it away. */
               if (initial_activity >= EGIS057E_INITIAL_TOUCH_THRESHOLD)
                 {
-                  self->touch_settle_frames = 3;
+                  self->touch_settle_frames = 0;
+                  self->touch_stable_frames = 0;
+                  self->touch_best_difference = G_MAXDOUBLE;
+                  self->have_touch_best_frame = FALSE;
                   self->touch_pending = TRUE;
                   fp_dbg ("initial activity indicates finger already present; waiting for stable contact");
                 }
@@ -374,6 +485,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
       else if (self->awaiting_release)
         {
           double captured_difference;
+          double clear_difference = G_MAXDOUBLE;
           double release_threshold =
             MAX (EGIS057E_RELEASE_MIN_DIFFERENCE,
                  self->change_threshold *
@@ -382,13 +494,23 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
           g_assert (self->have_captured_frame);
           frame_mean_difference (transfer->buffer, self->captured_frame,
                                  &captured_difference);
-          if (captured_difference >= release_threshold)
+          if (self->have_clear_frame)
+            frame_mean_difference (transfer->buffer, self->clear_frame,
+                                   &clear_difference);
+
+          /* A moved finger can differ greatly from the captured placement.
+           * Prefer positive evidence that the sensor returned to its known
+           * clear state; retain the old comparison only when activation began
+           * with a finger already present and no clear reference exists. */
+          if ((self->have_clear_frame && clear_difference <= release_threshold) ||
+              (!self->have_clear_frame &&
+               captured_difference >= release_threshold))
             self->release_frames++;
           else
             self->release_frames = 0;
 
-          fp_dbg ("finger-release difference %.4f, threshold %.4f, frames %u/%u",
-                  captured_difference, release_threshold,
+          fp_dbg ("finger-release captured difference %.4f, clear difference %.4f, threshold %.4f, frames %u/%u",
+                  captured_difference, clear_difference, release_threshold,
                   self->release_frames, EGIS057E_RELEASE_FRAMES);
           if (self->release_frames >= EGIS057E_RELEASE_FRAMES)
             {
@@ -403,10 +525,34 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
         {
           if (self->touch_pending)
             {
-              if (self->touch_settle_frames > 0)
-                self->touch_settle_frames--;
-              fp_dbg ("finger contact settling, %u frames remaining",
-                      self->touch_settle_frames);
+              self->touch_settle_frames++;
+              if (mean_difference <= EGIS057E_TOUCH_STABLE_MAX_DIFFERENCE)
+                {
+                  Egis057eImageQuality quality = image_quality (transfer->buffer);
+
+                  self->touch_stable_frames++;
+                  if (!self->have_touch_best_frame ||
+                      quality.score > self->touch_best_quality)
+                    {
+                      self->touch_best_difference = mean_difference;
+                      self->touch_best_quality = quality.score;
+                      memcpy (self->touch_best_frame, transfer->buffer,
+                              EGIS057E_IMAGE_LEN);
+                      self->have_touch_best_frame = TRUE;
+                    }
+                }
+              else
+                {
+                  self->touch_stable_frames = 0;
+                  self->touch_best_difference = G_MAXDOUBLE;
+                  self->touch_best_quality = -1.0;
+                  self->have_touch_best_frame = FALSE;
+                }
+              fp_dbg ("finger contact settling: activity %.4f, stable %u/%u, elapsed %u/%u",
+                      mean_difference, self->touch_stable_frames,
+                      EGIS057E_TOUCH_STABLE_FRAMES,
+                      self->touch_settle_frames,
+                      EGIS057E_TOUCH_SETTLE_MAX_FRAMES);
             }
           else if (mean_difference > self->change_threshold)
             self->finger_frames++;
@@ -423,20 +569,50 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
           if (self->finger_frames >= 2)
             {
               self->finger_frames = 0;
-              self->touch_settle_frames = 3;
+              self->touch_settle_frames = 0;
+              self->touch_stable_frames = 0;
+              self->touch_best_difference = G_MAXDOUBLE;
+              self->touch_best_quality = -1.0;
+              self->have_touch_best_frame = FALSE;
               self->touch_pending = TRUE;
               fp_dbg ("finger transition detected; waiting for stable contact");
             }
-          else if (self->touch_pending && self->touch_settle_frames == 0)
+          else if (self->touch_pending &&
+                   (self->touch_stable_frames >= EGIS057E_TOUCH_STABLE_FRAMES ||
+                    self->touch_settle_frames >= EGIS057E_TOUCH_SETTLE_MAX_FRAMES))
             {
               g_autoptr(FpImage) img = fp_image_new (EGIS057E_IMAGE_WIDTH,
                                                      EGIS057E_IMAGE_HEIGHT);
-              memcpy (img->data, transfer->buffer, EGIS057E_IMAGE_LEN);
-              fp_dbg ("temporal activity exceeded threshold; reporting automatic finger placement");
+              const guint8 *selected_frame = self->have_touch_best_frame ?
+                                               self->touch_best_frame :
+                                               transfer->buffer;
+
+              if (self->touch_stable_frames < EGIS057E_TOUCH_STABLE_FRAMES)
+                {
+                  fp_dbg ("contact did not stabilize in %u frames; requesting retry",
+                          self->touch_settle_frames);
+                  memcpy (self->captured_frame, transfer->buffer,
+                          EGIS057E_IMAGE_LEN);
+                  self->have_captured_frame = TRUE;
+                  self->awaiting_release = TRUE;
+                  self->touch_pending = FALSE;
+                  self->touch_settle_frames = 0;
+                  self->touch_stable_frames = 0;
+                  self->have_touch_best_frame = FALSE;
+                  fpi_image_device_report_finger_status (img_dev, TRUE);
+                  fpi_image_device_retry_scan (img_dev, FP_DEVICE_RETRY_TOO_FAST);
+                  goto image_done;
+                }
+              memcpy (img->data, selected_frame, EGIS057E_IMAGE_LEN);
+              fp_dbg ("contact settled; reporting best-quality stable frame (quality %.4f, difference %.4f)",
+                      self->touch_best_quality, self->touch_best_difference);
               self->touch_pending = FALSE;
               self->finger_frames = 0;
-              memcpy (self->captured_frame, transfer->buffer,
+              self->touch_settle_frames = 0;
+              self->touch_stable_frames = 0;
+              memcpy (self->captured_frame, selected_frame,
                       EGIS057E_IMAGE_LEN);
+              self->have_touch_best_frame = FALSE;
               self->have_captured_frame = TRUE;
               fpi_image_device_report_finger_status (img_dev, TRUE);
               self->reported_image = TRUE;
@@ -450,6 +626,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
         }
     }
 
+image_done:
   fpi_ssm_next_state (transfer->ssm);
 }
 
@@ -548,7 +725,17 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
           fpi_ssm_jump_to_state (ssm, SM_CAPTURE_DELAY);
           break;
         }
-      send_packet (ssm, dev, &egis057e_init_pkts[self->init_step]);
+      if (egis057e_init_pkts[self->init_step].bytes[4] == 0x63 &&
+          egis057e_init_pkts[self->init_step].bytes[5] == 0x33 &&
+          self->have_calibration_sample)
+        {
+          Egis057ePacket apply = egis057e_init_pkts[self->init_step];
+
+          apply.bytes[7] = self->calibration_sample;
+          send_packet (ssm, dev, &apply);
+        }
+      else
+        send_packet (ssm, dev, &egis057e_init_pkts[self->init_step]);
       break;
 
     case SM_INIT_RECV:
@@ -739,14 +926,21 @@ dev_activate (FpImageDevice *dev)
   self->int_ep    = EGIS057E_EP_INT_FINGER;
   self->have_previous_frame = FALSE;
   self->have_captured_frame = FALSE;
+  self->have_clear_frame = FALSE;
+  self->have_touch_best_frame = FALSE;
   self->detection_armed = FALSE;
   self->stable_frames = 0;
   self->finger_frames = 0;
   self->release_frames = 0;
   self->touch_settle_frames = 0;
+  self->touch_stable_frames = 0;
   self->touch_pending = FALSE;
   self->baseline_sum = 0.0;
   self->change_threshold = 0.0;
+  self->touch_best_difference = G_MAXDOUBLE;
+  self->touch_best_quality = -1.0;
+  self->calibration_sample = 0x6d;
+  self->have_calibration_sample = FALSE;
   self->awaiting_release = FALSE;
   self->reported_image = FALSE;
   self->capture_protocol_error = FALSE;
@@ -779,39 +973,40 @@ ridge_score (const guint8 *a, const guint8 *b)
   for (gint dy = -12; dy <= 12; dy++)
     for (gint dx = -12; dx <= 12; dx++)
       {
-        double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
-        guint count = 0;
+        double energy_a = 0, energy_b = 0, dot_product = 0;
 
         for (gint y = 4; y < EGIS057E_IMAGE_HEIGHT - 4; y++)
           for (gint x = 4; x < EGIS057E_IMAGE_WIDTH - 4; x++)
             {
               gint bx = x + dx;
               gint by = y + dy;
-              double va, vb;
+              double ax, ay, bx_gradient, by_gradient;
 
               if (bx < 4 || bx >= EGIS057E_IMAGE_WIDTH - 4 ||
                   by < 4 || by >= EGIS057E_IMAGE_HEIGHT - 4)
                 continue;
 
-              va = (gint) a[y * EGIS057E_IMAGE_WIDTH + x + 1] -
-                   (gint) a[y * EGIS057E_IMAGE_WIDTH + x - 1] +
-                   (gint) a[(y + 1) * EGIS057E_IMAGE_WIDTH + x] -
+              ax = (gint) a[y * EGIS057E_IMAGE_WIDTH + x + 1] -
+                   (gint) a[y * EGIS057E_IMAGE_WIDTH + x - 1];
+              ay = (gint) a[(y + 1) * EGIS057E_IMAGE_WIDTH + x] -
                    (gint) a[(y - 1) * EGIS057E_IMAGE_WIDTH + x];
-              vb = (gint) b[by * EGIS057E_IMAGE_WIDTH + bx + 1] -
-                   (gint) b[by * EGIS057E_IMAGE_WIDTH + bx - 1] +
-                   (gint) b[(by + 1) * EGIS057E_IMAGE_WIDTH + bx] -
-                   (gint) b[(by - 1) * EGIS057E_IMAGE_WIDTH + bx];
-              sa += va; sb += vb; saa += va * va; sbb += vb * vb;
-              sab += va * vb; count++;
+              bx_gradient =
+                (gint) b[by * EGIS057E_IMAGE_WIDTH + bx + 1] -
+                (gint) b[by * EGIS057E_IMAGE_WIDTH + bx - 1];
+              by_gradient =
+                (gint) b[(by + 1) * EGIS057E_IMAGE_WIDTH + bx] -
+                (gint) b[(by - 1) * EGIS057E_IMAGE_WIDTH + bx];
+              dot_product += ax * bx_gradient + ay * by_gradient;
+              energy_a += ax * ax + ay * ay;
+              energy_b += bx_gradient * bx_gradient +
+                          by_gradient * by_gradient;
             }
 
-        if (count)
+        if (energy_a > 0 && energy_b > 0)
           {
-            double numerator = sab - sa * sb / count;
-            double denominator = sqrt ((saa - sa * sa / count) *
-                                       (sbb - sb * sb / count));
-            if (denominator > 0)
-              best = MAX (best, numerator / denominator);
+            double denominator = sqrt (energy_a * energy_b);
+
+            best = MAX (best, dot_product / denominator);
           }
       }
 
@@ -823,9 +1018,20 @@ egis057e_enroll_image (FpImageDevice *dev, FpPrint *print,
                        FpImage *image, GError **error)
 {
   g_autoptr(GVariant) old_data = NULL;
+  Egis057eImageQuality quality = image_quality (image->data);
   GVariantBuilder builder;
   GVariantIter iter;
   GVariant *sample;
+
+  fp_dbg ("enrollment image quality: stddev %.2f, gradient %.2f, range %u",
+          quality.standard_deviation, quality.gradient_rms,
+          quality.intensity_range);
+  if (!image_quality_acceptable (&quality))
+    {
+      g_set_error (error, FP_DEVICE_RETRY, FP_DEVICE_RETRY_CENTER_FINGER,
+                   "Fingerprint image has insufficient ridge detail; reposition and retry");
+      return FALSE;
+    }
 
   g_object_get (print, "fpi-data", &old_data, NULL);
   g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
@@ -833,7 +1039,24 @@ egis057e_enroll_image (FpImageDevice *dev, FpPrint *print,
     {
       g_variant_iter_init (&iter, old_data);
       while ((sample = g_variant_iter_next_value (&iter)))
-        g_variant_builder_add_value (&builder, sample);
+        {
+          gsize length = 0;
+          const guint8 *bytes = g_variant_get_fixed_array (sample, &length, 1);
+
+          if (length == EGIS057E_IMAGE_LEN &&
+              ridge_score (bytes, image->data) >=
+                EGIS057E_ENROLL_DUPLICATE_THRESHOLD)
+            {
+              g_variant_unref (sample);
+              g_variant_builder_clear (&builder);
+              g_set_error (error, FP_DEVICE_RETRY,
+                           FP_DEVICE_RETRY_CENTER_FINGER,
+                           "Enrollment image duplicates an earlier placement; reposition and retry");
+              return FALSE;
+            }
+          g_variant_builder_add_value (&builder, sample);
+          g_variant_unref (sample);
+        }
     }
   g_variant_builder_add_value (&builder,
                                g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
@@ -848,11 +1071,22 @@ egis057e_match_image (FpImageDevice *dev, FpPrint *print,
                       FpImage *image, GError **error)
 {
   g_autoptr(GVariant) data = NULL;
+  Egis057eImageQuality quality = image_quality (image->data);
   GVariantIter iter;
   GVariant *sample;
   double best = -1.0;
   double second = -1.0;
   guint sample_index = 0;
+
+  fp_dbg ("verification image quality: stddev %.2f, gradient %.2f, range %u",
+          quality.standard_deviation, quality.gradient_rms,
+          quality.intensity_range);
+  if (!image_quality_acceptable (&quality))
+    {
+      g_set_error (error, FP_DEVICE_RETRY, FP_DEVICE_RETRY_CENTER_FINGER,
+                   "Fingerprint image has insufficient ridge detail; reposition and retry");
+      return FPI_MATCH_ERROR;
+    }
 
   g_object_get (print, "fpi-data", &data, NULL);
   if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("aay")))

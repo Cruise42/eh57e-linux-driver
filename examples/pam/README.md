@@ -7,7 +7,7 @@ The tested logical ordering was fingerprint first, then the normal Unix
 password module. One example fingerprint entry is:
 
 ```pam
-auth [success=2 default=ignore] pam_fprintd.so max-tries=1 timeout=30
+auth [success=2 default=ignore] pam_fprintd.so max-tries=3 timeout=30
 ```
 
 The jump count depends on the surrounding PAM stack and **must not be copied
@@ -23,3 +23,8 @@ Cinnamon's lock screen may show only its normal password field while
 fingerprint verification runs in the background. On the tested setup, waiting
 several seconds for calibration and then resting—not clicking—the finger on the
 reader unlocked successfully.
+
+With `max-tries=3`, failed scans are retried and a later good scan can unlock
+the session. Cinnamon 6 may not display an intermediate failure or reposition
+message; on the tested setup it kept showing the static finger prompt. This is
+a frontend feedback limitation, not evidence that the retry was ignored.
