@@ -1,6 +1,48 @@
 # Safe testing procedure
 
+## Isolated verification following the observed false acceptance
+
+Do not use lock-screen or sudo unlocks to test the current matcher. Keep
+fprintd stopped and masked while exercising libfprint directly. The optional
+`tools/egis057e_verify_isolated.c` reads an existing serialized template and
+reports decisions without PAM, template writes, image files, or session access.
+
+Build with `make build/egis057e_verify_isolated` using libfprint development
+headers; `FPRINT_CFLAGS` and `FPRINT_LIBS` can select a development build.
+Run with the EH57E library explicitly selected:
+
+```sh
+sudo env LD_LIBRARY_PATH=/path/to/test-build/libfprint \
+  ./build/egis057e_verify_isolated /path/to/protected/template 3
+```
+
+The optional count is 1–3. Each trial has a 60-second limit. Exit status reports
+test execution, not authentication success. Inspect the printed MATCH/NO MATCH
+or RETRY result. It cancels each verification after the early result to exercise
+the same restart lifecycle as fprintd. A held contact should block the next
+decision until the finger is removed. Cancellation and hardware errors are
+reported separately from decisions. Do not publish template files or raw scans.
+
 ## 1. Preserve password access
+
+### September 2026 isolated retry regression results
+
+With thresholds restored to 0.34/0.27, a three-trial run on one open device
+produced these best/second scores:
+
+| Trial | Finger presented | Scores | Decision |
+| --- | --- | --- | --- |
+| 1 | Unenrolled | 0.1194 / 0.0903 | No match |
+| 2, after removal | Same unenrolled finger | 0.1653 / 0.1091 | No match |
+| 3, after removal | Enrolled finger | 0.5225 / 0.3415 | Match |
+
+Each restart waited for removal while the previous contact was held. Removal
+was detected and an empty-sensor baseline collected before the next placement.
+No runtime calibration command was repeated between these trials. A separate
+unenrolled placement scored 0.2195/0.1632 and was rejected. All of these
+unenrolled results also fall below the former lower thresholds, so these tests
+validate retry behavior but do not establish an acceptable false-accept rate.
+System fingerprint authentication remained disabled throughout testing.
 
 Before loading the driver:
 

@@ -4,6 +4,8 @@ CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
 LIBUSB_CFLAGS := $(shell pkg-config --cflags libusb-1.0)
 LIBUSB_LIBS := $(shell pkg-config --libs libusb-1.0)
+FPRINT_CFLAGS = $(shell pkg-config --cflags libfprint-2 gio-2.0)
+FPRINT_LIBS = $(shell pkg-config --libs libfprint-2 gio-2.0)
 
 .PHONY: all clean
 
@@ -20,6 +22,10 @@ build/egis057e_match_eval: tools/egis057e_match_eval.c | build
 
 build/raw_to_pgm: tools/raw_to_pgm.c | build
 	$(CC) $(CFLAGS) -o $@ $<
+
+# Optional: requires libfprint development headers and the EH57E build at runtime.
+build/egis057e_verify_isolated: tools/egis057e_verify_isolated.c | build
+	$(CC) $(CFLAGS) $(FPRINT_CFLAGS) -o $@ $< $(FPRINT_LIBS)
 
 clean:
 	$(RM) -r build

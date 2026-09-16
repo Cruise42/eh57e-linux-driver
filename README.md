@@ -13,6 +13,11 @@ were demonstrated on one development machine, including desktop UI enrollment,
 
 ## Important warning
 
+An unenrolled finger was accepted during a September 2026 lock-screen test
+with the vector-gradient matcher at thresholds 0.30/0.23. Those thresholds
+have been reverted locally, but the matcher remains unvalidated. Do not use
+this prototype to authorize login or sudo; continue testing outside PAM.
+
 There is **no warranty that this code will work on any other computer, sensor
 revision, Linux distribution, libfprint release, or desktop environment**.
 It may fail, lock the reader, prevent authentication, generate false accepts or

@@ -13,8 +13,13 @@ read_frame (const char *path, unsigned char *image, long offset)
 {
   FILE *f = fopen (path, "rb");
   int ok;
-  if (!f || fseek (f, offset, SEEK_SET))
+  if (!f)
     return 0;
+  if (fseek (f, offset, SEEK_SET))
+    {
+      fclose (f);
+      return 0;
+    }
   ok = fread (image, 1, N, f) == N;
   fclose (f);
   return ok;
@@ -64,6 +69,9 @@ main (int argc, char **argv)
   long ob = argc > 4 ? strtol (argv[4], NULL, 0) : 0;
   if (argc < 3 || !read_frame (argv[1], a, oa) || !read_frame (argv[2], b, ob))
     return EXIT_FAILURE;
-  printf ("%.6f dx=%d dy=%d\n", score (a, b, &dx, &dy), dx, dy);
+  /* Finish scoring before reading its output offsets: argument evaluation
+   * order is unspecified. */
+  double value = score (a, b, &dx, &dy);
+  printf ("%.6f dx=%d dy=%d\n", value, dx, dy);
   return EXIT_SUCCESS;
 }

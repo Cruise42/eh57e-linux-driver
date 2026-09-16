@@ -34,8 +34,10 @@
 
 #include "egis057e.h"
 
-#define EGIS057E_MATCH_THRESHOLD 0.30
-#define EGIS057E_SECOND_MATCH_THRESHOLD 0.23
+/* Conservative experimental baseline, NOT a validated security boundary.
+ * The reduced 0.30/0.23 pair admitted an unenrolled finger. */
+#define EGIS057E_MATCH_THRESHOLD 0.34
+#define EGIS057E_SECOND_MATCH_THRESHOLD 0.27
 #define EGIS057E_ENROLL_DUPLICATE_THRESHOLD 0.92
 #define EGIS057E_FRAME_CHANGE_MARGIN 0.10
 #define EGIS057E_SETTLING_FRAMES 8
@@ -64,6 +66,8 @@ struct _FpDeviceEgis057e
   gboolean      running;
   gboolean      stop;
   gboolean      activated;
+  gboolean      calibration_valid;
+  gboolean      resume_release;
 
   guint         init_step;        /* current index in egis057e_init[]   */
   guint         capture_step;     /* current index in capture sequence  */
@@ -542,6 +546,17 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               self->release_frames = 0;
               self->have_captured_frame = FALSE;
               fpi_image_device_report_finger_status (img_dev, FALSE);
+              if (self->resume_release)
+                {
+                  /* Start a fresh empty-sensor baseline only after the old
+                   * contact has ended. Do not reuse its elevated activity. */
+                  self->resume_release = FALSE;
+                  self->detection_armed = FALSE;
+                  self->stable_frames = 0;
+                  self->baseline_sum = 0.0;
+                  self->have_clear_frame = FALSE;
+                  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+                }
             }
         }
       else
@@ -737,13 +752,21 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
     /* --- Init phase ---------------------------------------------------- */
 
     case SM_INIT_SEND:
+      /* A cancelled verification can leave the old finger on the sensor.
+       * Recover command state and restore live image mode, but skip the
+       * calibration commands until that contact has been released. */
+      if (self->resume_release && self->init_step == 4)
+        self->init_step = 17;
       if (self->init_step >= G_N_ELEMENTS (egis057e_init_pkts))
         {
+          self->calibration_valid = TRUE;
           fp_dbg ("image-path init complete; starting automatic frame-change detection");
           if (!self->activated)
             {
               self->activated = TRUE;
               fpi_image_device_activate_complete (img_dev, NULL);
+              if (self->resume_release)
+                fpi_device_report_finger_status (dev, FP_FINGER_STATUS_PRESENT);
             }
           fpi_ssm_jump_to_state (ssm, SM_CAPTURE_DELAY);
           break;
@@ -901,6 +924,7 @@ loop_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   if (error)
     {
+      self->calibration_valid = FALSE;
       if (!self->activated)
         {
           self->activated = TRUE;
@@ -920,7 +944,10 @@ loop_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 static void
 dev_init (FpImageDevice *dev)
 {
+  FpDeviceEgis057e *self = FPI_DEVICE_EGIS057E (dev);
   GError           *error = NULL;
+  self->calibration_valid = FALSE;
+  self->awaiting_release = FALSE;
   g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
                                 0, 0, &error);
 
@@ -930,7 +957,10 @@ dev_init (FpImageDevice *dev)
 static void
 dev_deinit (FpImageDevice *dev)
 {
+  FpDeviceEgis057e *self = FPI_DEVICE_EGIS057E (dev);
   GError           *error = NULL;
+  self->calibration_valid = FALSE;
+  self->awaiting_release = FALSE;
   g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
                                    0, 0, &error);
 
@@ -943,15 +973,25 @@ dev_activate (FpImageDevice *dev)
   FpDeviceEgis057e *self = FPI_DEVICE_EGIS057E (dev);
   FpiSsm           *ssm;
 
+  self->resume_release = self->calibration_valid && self->awaiting_release &&
+                         self->have_captured_frame;
+  if (self->resume_release)
+    fp_dbg ("verification restarted with unreleased contact; preserving calibration and waiting for removal");
   self->stop      = FALSE;
   self->init_step = 0;
   self->activated = FALSE;
   self->int_ep    = EGIS057E_EP_INT_FINGER;
   self->have_previous_frame = FALSE;
-  self->have_captured_frame = FALSE;
-  self->have_clear_frame = FALSE;
+  if (!self->resume_release)
+    {
+      self->have_captured_frame = FALSE;
+      self->have_clear_frame = FALSE;
+      self->change_threshold = 0.0;
+      self->calibration_sample = 0x6d;
+      self->have_calibration_sample = FALSE;
+    }
   self->have_touch_best_frame = FALSE;
-  self->detection_armed = FALSE;
+  self->detection_armed = self->resume_release;
   self->stable_frames = 0;
   self->finger_frames = 0;
   self->release_frames = 0;
@@ -959,12 +999,9 @@ dev_activate (FpImageDevice *dev)
   self->touch_stable_frames = 0;
   self->touch_pending = FALSE;
   self->baseline_sum = 0.0;
-  self->change_threshold = 0.0;
   self->touch_best_difference = G_MAXDOUBLE;
   self->touch_best_quality = -1.0;
-  self->calibration_sample = 0x6d;
-  self->have_calibration_sample = FALSE;
-  self->awaiting_release = FALSE;
+  self->awaiting_release = self->resume_release;
   self->reported_image = FALSE;
   self->capture_protocol_error = FALSE;
 

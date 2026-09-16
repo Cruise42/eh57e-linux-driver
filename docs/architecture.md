@@ -53,10 +53,13 @@ sample while scoring at most `0.20` against every other sample. The current
 decision rule therefore requires:
 
 ```text
-best score >= 0.30 AND second-best score >= 0.23
+best score >= 0.34 AND second-best score >= 0.27
 ```
 
 Those values are experimental, unit-specific, and not a security proof.
+The temporary 0.30/0.23 vector-gradient thresholds admitted an unenrolled
+finger scoring 0.3266/0.2396. Restoring these higher thresholds rejects that
+recorded result but does not validate the matcher for authentication.
 
 ## Capture state machine
 
@@ -102,10 +105,19 @@ the contact-settling period directly. The spatial check covers a finger held
 completely still before PAM activates the reader; temporal activity alone
 would incorrectly learn that image as the clear-sensor baseline.
 
-Every image-device activation runs the complete initialization sequence. The
+An activation normally runs the complete initialization sequence. The
 short four-command recovery prefix resets command state but does not reliably
 restore live-image updates after an identify-to-enroll transition; reapplying
 normal image mode and the image-window registers does.
+
+If verification restarts within the same open device session while the last
+captured contact is still present, retain the calibration and release reference.
+Run the four-command recovery prefix followed by normal image-mode/window
+setup, skipping calibration. Do not submit another image until removal is
+observed, then collect a fresh baseline. Report PRESENT without NEEDED during
+this wait; frontend display of a lift-finger prompt is not guaranteed. Close or
+protocol failure invalidates cached calibration. This prevents repeated scans
+and recalibration of a held finger from consuming all PAM attempts.
 
 After every capture, including verify/identify, the driver retains both the
 accepted finger frame and, when available, an activation-specific clear-sensor

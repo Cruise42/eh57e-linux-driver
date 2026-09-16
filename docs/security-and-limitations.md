@@ -2,6 +2,13 @@
 
 ## Not security-audited
 
+An unenrolled finger was accepted by the vector-gradient matcher at thresholds
+0.30/0.23 in September 2026. Its best/second scores were 0.3266/0.2396.
+Restoring 0.34/0.27 excludes this single observation but establishes no
+false-accept rate. Keep this matcher out of PAM authentication pending
+independent validation with genuine and impostor scans. Retry handling fixes
+do not repair identity discrimination.
+
 This driver is a functional research prototype, not a certified biometric
 authentication product. It was tested with a very small number of fingers on
 one sensor. Its false-accept and false-reject rates are unknown.
